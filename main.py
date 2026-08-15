@@ -37,12 +37,16 @@ def cleanup_keys():
     kho_key = [k for k in kho_key if k['expiry'] > now]
 
 async def check_user_in_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # Nếu là ADMIN thì mặc định cho qua
+    if user_id == ADMIN_ID:
+        return True
     try:
         member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
-        if member.status in ['creator', 'administrator', 'member']:
+        if member.status in ['creator', 'administrator', 'member', 'restricted']:
             return True
         return False
-    except Exception:
+    except Exception as e:
+        print(f"Lỗi kiểm tra thành viên: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,4 +182,4 @@ if __name__ == '__main__':
     
     print("Bot đang chạy...")
     app.run_polling()
-  
+    
