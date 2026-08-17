@@ -1,22 +1,22 @@
-import datetime
+import asyncio
+import logging
 import os
-import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import sqlite3
 import threading
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ==========================================
-# 1. CẤU HÌNH MÚI GIỜ VIỆT NAM (UTC+7)
-# ==========================================
-VN_TZ = datetime.timezone(datetime.timedelta(hours=7))
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-def get_now_vn():
-    return datetime.datetime.now(VN_TZ)
+# ========================== CẤU HÌNH ==========================
+TOKEN = "8600522241:AAGEQ6zu70HZSTJkoZpn0Ltz4CE3qx-JwHI"
+ADMIN_ID = 8925234034
 
-# ==========================================
-# 2. WEBSERVER GIỮ BOT SỐNG TRÊN RENDER (KEEP-ALIVE)
-# ==========================================
+# ========================== WEBSERVER KEEP-ALIVE ==========================
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -28,251 +28,482 @@ def run_dummy_server():
     server = HTTPServer(('0.0.0.0', port), DummyHandler)
     server.serve_forever()
 
-# ==========================================
-# 3. THÔNG TIN CẤU HÌNH BOT & KÊNH/NHÓM
-# ==========================================
-TOKEN = "8600522241:AAGEQ6zu70HZSTJkoZpn0Ltz4CE3qx-JwHI" # Token Bot
-ADMIN_ID = 8925234034                                  # ID Telegram Admin
-GROUP_ID = -1004489838407                              # ID Kênh hoặc Nhóm
-GROUP_LINK = "https://t.me/Xxxhuyh"                    # Link Kênh hoặc Nhóm
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
-kho_key = []
+# ========================== DATABASE ==========================
+DB_NAME = "shop.db"
 
-def cleanup_keys():
-    now = get_now_vn()
-    global kho_key
-    kho_key = [k for k in kho_key if k['expiry'] > now]
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        registered_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS wallets (
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        price INTEGER,
+        stock INTEGER DEFAULT 0,
+        description TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        category_id INTEGER,
+        quantity INTEGER,
+        total_price INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        type TEXT,
+        amount INTEGER,
+        description TEXT,
+        timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
 
-async def check_user_in_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Hàm kiểm tra xem người dùng đã tham gia Kênh / Nhóm chưa"""
-    if user_id == ADMIN_ID:
-        return True
-    try:
-        member = await context.bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
-        if member.status in ['creator', 'administrator', 'member', 'restricted']:
-            return True
-        return False
-    except Exception as e:
-        print(f"Lỗi kiểm tra thành viên: {e}")
-        return False
+init_db()
 
-# ==========================================
-# 4. LỆNH /start (GIAO DIỆN CHÍNH)
-# ==========================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    reply_keyboard = [
-        ["🔑 Lấy Key Ngay"],
-        ["🚀 Bắt Đầu Lại (/start)", "📢 Nhóm Telegram"],
-        ["ℹ️ Trợ Giúp"]
+# ========================== FSM STATES ==========================
+class DepositStates(StatesGroup):
+    waiting_amount = State()
+
+# ========================== BOT INIT ==========================
+storage = MemoryStorage()
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=storage)
+
+# ========================== DB HELPER ==========================
+def get_db():
+    return sqlite3.connect(DB_NAME)
+
+def register_user(user_id, username, full_name):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?,?,?)", (user_id, username, full_name))
+    c.execute("INSERT OR IGNORE INTO wallets (user_id, balance) VALUES (?,0)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_balance(user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM wallets WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def add_balance(user_id, amount):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE wallets SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
+
+def deduct_balance(user_id, amount):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE wallets SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, user_id, amount))
+    conn.commit()
+    conn.close()
+
+def get_categories():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, name, price, stock, description FROM categories ORDER BY id")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_category(category_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, name, price, stock FROM categories WHERE id=?", (category_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def reduce_stock(category_id, quantity=1):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE categories SET stock = stock - ? WHERE id=? AND stock >= ?", (quantity, category_id, quantity))
+    conn.commit()
+    conn.close()
+
+def create_order(user_id, category_id, quantity, total_price):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO orders (user_id, category_id, quantity, total_price) VALUES (?,?,?,?)",
+              (user_id, category_id, quantity, total_price))
+    conn.commit()
+    conn.close()
+
+def add_transaction(user_id, type, amount, description=""):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO transactions (user_id, type, amount, description) VALUES (?,?,?,?)",
+              (user_id, type, amount, description))
+    conn.commit()
+    conn.close()
+
+def create_pending_deposit(user_id, amount):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO pending_deposits (user_id, amount) VALUES (?,?)", (user_id, amount))
+    deposit_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return deposit_id
+
+def get_pending_deposit(deposit_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, amount, status FROM pending_deposits WHERE id=?", (deposit_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def update_pending_deposit(deposit_id, status):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("UPDATE pending_deposits SET status=? WHERE id=?", (status, deposit_id))
+    conn.commit()
+    conn.close()
+
+def get_user_transactions(user_id, limit=10):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT type, amount, description, timestamp FROM transactions WHERE user_id=? ORDER BY timestamp DESC LIMIT ?",
+              (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# ========================== MENU CHÍNH ==========================
+def main_menu_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="💰 Số dư", callback_data="balance")],
+        [InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit")],
+        [InlineKeyboardButton(text="🛒 Mua acc", callback_data="buy_menu")],
+        [InlineKeyboardButton(text="📜 Lịch sử", callback_data="history")],
+        [InlineKeyboardButton(text="📞 Liên hệ", callback_data="contact")]
     ]
-    markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    msg = (
-        "🤖 **XIN CHÀO MỌI NGHƯỜI ĐẾN VỚI BOT LẤY KEY TỰ ĐỘNG!**\n\n"
-        "👇 *Bấm nút '🔑 Lấy Key Ngay' ở bàn phím bên dưới để nhận key nhanh nhé!*\n"
+# ========================== START ==========================
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user = message.from_user
+    register_user(user.id, user.username, user.full_name)
+    await message.answer(
+        "🤖 **CỬA HÀNG ACC CLONE FF**\n\n"
+        "Chọn chức năng bên dưới:",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
     )
-    
-    if user_id == ADMIN_ID:
-        msg += (
-            "\n👑 **MENU DÀNH CHO ADMIN:**\n"
-            "• `/them <key> <thời_gian>` : Thêm key (Ví dụ: `/them ABC 2h`)\n"
-            "• `/soluong` : Xem tổng số key còn lại\n"
-            "• `/xemkho` : Xem danh sách tất cả key\n"
-            "• `/thongbao <nội_dung>` : Gửi thông báo đến người dùng\n"
-        )
-    
-    await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=markup)
 
-# ==========================================
-# 5. XỬ LÝ LẤY KEY TỰ ĐỘNG & BÁO VỀ ADMIN
-# ==========================================
-async def process_lay_key(user, send_func, context):
-    user_id = user.id
-    first_name = user.first_name or "Không tên"
-    username = f"@{user.username}" if user.username else "Không có"
+# ========================== CALLBACKS ==========================
+@dp.callback_query(lambda c: c.data == "balance")
+async def show_balance(callback: CallbackQuery):
+    bal = get_balance(callback.from_user.id)
+    await callback.message.edit_text(
+        f"💰 **Số dư của bạn:** {bal:,}đ",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
 
-    # 1. Kiểm tra tham gia Kênh/Nhóm
-    is_in_group = await check_user_in_group(user_id, context)
-    
-    if not is_in_group:
-        keyboard = [
-            [InlineKeyboardButton("📢 Tham gia nhóm ngay", url=GROUP_LINK)],
-            [InlineKeyboardButton("🔄 Bấm vào đây sau khi đã vào nhóm", callback_data="check_and_get_key")]
+# ====================== NẠP TIỀN (CÓ PLACEHOLDER) ======================
+@dp.callback_query(lambda c: c.data == "deposit")
+async def show_deposit(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    text = (
+        "💳 **NẠP TIỀN TỰ ĐỘNG**\n\n"
+        "• STK: 123456789\n"
+        "• Bank: MB Bank\n"
+        "• Chủ TK: NGUYEN VAN A\n"
+        f"• Nội dung (BẮT BUỘC): `NAP{user_id}`\n\n"
+        "Chuyển bao nhiêu thì bot sẽ cộng đúng bấy nhiêu vào số dư.\n"
+        "Không cần nhập số tiền trước, không cần tạo đơn.\n"
+        "Bot tự động quét API ngân hàng mỗi vài giây.\n\n"
+        "👉 Sau khi chuyển, bấm nút bên dưới để kiểm tra."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("🔄 Kiểm tra lại / Làm mới", callback_data="check_deposit")],
+        [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "check_deposit")
+async def check_deposit(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💳 Vui lòng nhập **số tiền bạn đã chuyển** (VD: 50000):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+        ])
+    )
+    await callback.answer()
+    await dp.fsm.storage.set_state(chat=callback.message.chat.id, user=callback.from_user.id, state=DepositStates.waiting_amount)
+
+# ====================== MUA ACC ======================
+@dp.callback_query(lambda c: c.data == "buy_menu")
+async def show_buy_menu(callback: CallbackQuery):
+    categories = get_categories()
+    if not categories:
+        await callback.message.edit_text("❌ Chưa có loại acc nào.", reply_markup=main_menu_keyboard())
+        await callback.answer()
+        return
+
+    text = "🛒 **KHU VỰC MUA ACC**\n\n"
+    buttons = []
+    for cat in categories:
+        stock = cat[3]
+        price = cat[2]
+        name = cat[1]
+        text += f"• **{name}**\n  Giá: {price:,}đ | Tồn: {stock}\n\n"
+        if stock > 0:
+            buttons.append([InlineKeyboardButton(f"Mua {name} ({price:,}đ)", callback_data=f"buy_{cat[0]}")])
+    if not buttons:
+        text += "❌ Tất cả acc đã hết hàng."
+    buttons.append([InlineKeyboardButton("🔙 Trở lại menu", callback_data="back_main")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("buy_"))
+async def process_buy(callback: CallbackQuery):
+    category_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+
+    cat = get_category(category_id)
+    if not cat or cat[3] <= 0:
+        await callback.answer("Loại acc này đã hết!", show_alert=True)
+        return
+
+    price = cat[2]
+    balance = get_balance(user_id)
+    if balance < price:
+        await callback.answer(f"❌ Không đủ tiền! Cần {price:,}đ, bạn có {balance:,}đ.", show_alert=True)
+        return
+
+    deduct_balance(user_id, price)
+    reduce_stock(category_id, 1)
+    create_order(user_id, category_id, 1, price)
+    add_transaction(user_id, "purchase", -price, f"Mua {cat[1]}")
+
+    await callback.message.edit_text(
+        f"✅ **Mua thành công!**\n"
+        f"Bạn đã mua 1 {cat[1]} với giá {price:,}đ.\n"
+        f"Số dư còn lại: {get_balance(user_id):,}đ.\n\n"
+        f"Vui lòng kiểm tra inbox để nhận acc (nếu có).",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "history")
+async def show_history(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    transactions = get_user_transactions(user_id, limit=10)
+    if not transactions:
+        text = "📜 Chưa có giao dịch nào."
+    else:
+        text = "📜 **Lịch sử (10 gần nhất):**\n\n"
+        for t in transactions:
+            typ = "➕ Nạp" if t[0] == 'deposit' else "➖ Mua"
+            text += f"{typ} {t[1]:,}đ - {t[2]} - {t[3]}\n"
+    await callback.message.edit_text(text, reply_markup=main_menu_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "contact")
+async def show_contact(callback: CallbackQuery):
+    text = "📞 **LIÊN HỆ**\n\n• Chat admin để xử lý nhanh\n• Vào nhóm chat để hỏi thêm\n• Theo dõi kênh để cập nhật"
+    buttons = [
+        [InlineKeyboardButton("👤 Chat Admin", url="https://t.me/huyh_ff")],
+        [InlineKeyboardButton("📢 Kênh", url="https://t.me/Xxxhuyh")],
+        [InlineKeyboardButton("👥 Nhóm chat", url="https://t.me/your_group_chat")],
+        [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "back_main")
+async def back_to_main(callback: CallbackQuery):
+    await callback.message.edit_text("🏠 **Menu chính**", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+# ====================== NHẬP SỐ TIỀN NẠP ======================
+@dp.message(StateFilter(DepositStates.waiting_amount))
+async def deposit_amount(message: Message, state: FSMContext):
+    try:
+        amount = int(message.text.strip().replace(',', ''))
+        if amount <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Số tiền không hợp lệ. Nhập lại:")
+        return
+
+    user_id = message.from_user.id
+    deposit_id = create_pending_deposit(user_id, amount)
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("✅ Xác nhận", callback_data=f"confirm_deposit_{deposit_id}")],
+        [InlineKeyboardButton("❌ Từ chối", callback_data=f"reject_deposit_{deposit_id}")]
+    ])
+    await bot.send_message(
+        ADMIN_ID,
+        f"💳 **YÊU CẦU NẠP TIỀN**\nUser: {user_id}\nSố tiền: {amount:,}đ\nMã yêu cầu: #{deposit_id}",
+        reply_markup=admin_kb
+    )
+
+    await message.answer(
+        f"✅ Đã ghi nhận yêu cầu nạp {amount:,}đ.\n"
+        f"Vui lòng chờ admin xác nhận.",
+        reply_markup=main_menu_keyboard()
+    )
+    await state.clear()
+
+# ========================== ADMIN XỬ LÝ NẠP ==========================
+@dp.callback_query(lambda c: c.data and c.data.startswith("confirm_deposit_"))
+async def confirm_deposit(callback: CallbackQuery):
+    deposit_id = int(callback.data.split("_")[2])
+    deposit = get_pending_deposit(deposit_id)
+    if not deposit or deposit[3] != 'pending':
+        await callback.answer("Yêu cầu không hợp lệ hoặc đã xử lý.", show_alert=True)
+        return
+    user_id, amount = deposit[1], deposit[2]
+    add_balance(user_id, amount)
+    add_transaction(user_id, "deposit", amount, f"Nạp qua admin (mã #{deposit_id})")
+    update_pending_deposit(deposit_id, "confirmed")
+    try:
+        await bot.send_message(user_id, f"💰 **Nạp tiền thành công!**\nSố tiền {amount:,}đ đã được cộng vào ví.")
+    except:
+        pass
+    await callback.message.edit_text(f"✅ Đã xác nhận nạp #{deposit_id} ({amount:,}đ) cho user {user_id}.")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("reject_deposit_"))
+async def reject_deposit(callback: CallbackQuery):
+    deposit_id = int(callback.data.split("_")[2])
+    deposit = get_pending_deposit(deposit_id)
+    if not deposit or deposit[3] != 'pending':
+        await callback.answer("Yêu cầu không hợp lệ hoặc đã xử lý.", show_alert=True)
+        return
+    update_pending_deposit(deposit_id, "cancelled")
+    try:
+        await bot.send_message(deposit[1], "❌ Yêu cầu nạp tiền của bạn đã bị từ chối.")
+    except:
+        pass
+    await callback.message.edit_text(f"❌ Đã từ chối nạp #{deposit_id}.")
+    await callback.answer()
+
+# ========================== ADMIN LỆNH ==========================
+@dp.message(Command("addcat"))
+async def add_category(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 4:
+        await message.answer("Sai cú pháp: /addcat <tên> <giá> <số_lượng>")
+        return
+    name, price, stock = parts[1], int(parts[2]), int(parts[3])
+    desc = parts[4] if len(parts) > 4 else ""
+    conn = get_db()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO categories (name, price, stock, description) VALUES (?,?,?,?)", (name, price, stock, desc))
+        conn.commit()
+        await message.answer(f"✅ Đã thêm {name} - {price:,}đ - tồn {stock}")
+    except sqlite3.IntegrityError:
+        await message.answer("❌ Tên đã tồn tại.")
+    conn.close()
+
+@dp.message(Command("delcat"))
+async def delete_category(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Sai cú pháp: /delcat <tên>")
+        return
+    name = parts[1]
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM categories WHERE name=?", (name,))
+    if c.rowcount > 0:
+        conn.commit()
+        await message.answer(f"✅ Đã xóa {name}")
+    else:
+        await message.answer("❌ Không tìm thấy.")
+    conn.close()
+
+@dp.message(Command("pending"))
+async def list_pending(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, amount, created_at FROM pending_deposits WHERE status='pending'")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("Không có yêu cầu nạp nào.")
+        return
+    text = "📋 Yêu cầu nạp chờ:\n"
+    for r in rows:
+        text += f"#{r[0]} | User {r[1]} | {r[2]:,}đ | {r[3]}\n"
+    await message.answer(text)
+
+@dp.message(Command("addmoney"))
+async def add_money(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Sai cú pháp: /addmoney <user_id> <số_tiền>")
+        return
+    uid, amt = int(parts[1]), int(parts[2])
+    add_balance(uid, amt)
+    add_transaction(uid, "deposit", amt, "Admin cộng trực tiếp")
+    await message.answer(f"✅ Đã cộng {amt:,}đ cho {uid}")
+    try:
+        await bot.send_message(uid, f"💰 Admin đã cộng {amt:,}đ vào ví của bạn.")
+    except:
+        pass
+
+# ========================== RUN ==========================
+async def main():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM categories")
+    if c.fetchone()[0] == 0:
+        sample = [
+            ("ACC LV5", 1700, 143, "Acc level 5"),
+            ("ACC Rank KC", 35000, 0, "Rank Kim Cương"),
+            ("ACC Rank Huyền Thoại", 50000, 0, "Rank Huyền Thoại"),
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await send_func(
-            "⚠️ **Bạn phải tham gia nhóm/kênh Telegram mới có thể lấy key!**\n\n"
-            "👉 Bấm nút bên dưới để tham gia, sau đó quay lại chọn **🔑 Lấy Key Ngay**.",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
+        c.executemany("INSERT INTO categories (name, price, stock, description) VALUES (?,?,?,?)", sample)
+        conn.commit()
+    conn.close()
 
-    # 2. Xóa các key hết hạn
-    cleanup_keys()
-    
-    # 3. Xuất key nếu còn
-    if kho_key:
-        data = kho_key.pop(0) 
-        time_str = data['expiry'].strftime("%H:%M:%S %d/%m/%Y")
-        
-        keyboard = [[InlineKeyboardButton("🔑 Bấm để Lấy Key Tiếp", callback_data="check_and_get_key")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    await dp.start_polling(bot)
 
-        # Gửi key cho Khách
-        await send_func(
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔑 **KEY CỦA BẠN:** `{data['key']}`\n"
-            f"⏰ **Hạn sử dụng:** {time_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"*(Sao chép key bằng cách ấn trực tiếp vào mã key)*",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-
-        # 🔔 GỬI THÔNG BÁO VỀ CHO ADMIN (Nếu người lấy không phải Admin)
-        if user_id != ADMIN_ID:
-            try:
-                admin_msg = (
-                    "🔔 **CÓ KHÁCH VỪA LẤY KEY!**\n\n"
-                    f"👤 **Tên:** {first_name}\n"
-                    f"🆔 **ID:** `{user_id}`\n"
-                    f"🌐 **Username:** {username}\n"
-                    f"🔑 **Key đã cấp:** `{data['key']}`\n"
-                    f"⏳ **Hạn dùng:** {time_str}"
-                )
-                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode='Markdown')
-            except Exception as e:
-                print(f"Lỗi gửi thông báo cho Admin: {e}")
-
-    else:
-        await send_func("❌ **Hiện tại đã hết key trong kho, vui lòng chờ Admin cấp thêm nhé!** 👀", parse_mode='Markdown')
-
-async def lay_key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await process_lay_key(update.effective_user, update.message.reply_text, context)
-
-# ==========================================
-# 6. LẮNG NGHE & XỬ LÝ NÚT BẤM
-# ==========================================
-async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-
-    if text == "🔑 Lấy Key Ngay":
-        await process_lay_key(update.effective_user, update.message.reply_text, context)
-    elif text in ["🚀 Bắt Đầu Lại (/start)", "🚀 Bắt Đầu"]:
-        await start(update, context)
-    elif text == "📢 Nhóm Telegram":
-        keyboard = [[InlineKeyboardButton("👉 Vào Nhóm/Kênh Ngay", url=GROUP_LINK)]]
-        await update.message.reply_text("📢 **Bấm vào nút bên dưới để truy cập:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-    elif text == "ℹ️ Trợ Giúp":
-        await update.message.reply_text("💡 **HƯỚNG DẪN:**\n- Bấm nút `🔑 Lấy Key Ngay` để nhận key dùng thử.\n- Nếu gặp sự cố, liên hệ Admin.", parse_mode='Markdown')
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "check_and_get_key":
-        async def send_msg(text, parse_mode=None, reply_markup=None):
-            await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-            
-        await process_lay_key(query.from_user, send_msg, context)
-
-# ==========================================
-# 7. CÁC LỆNH QUẢN LÝ CỦA ADMIN
-# ==========================================
-async def them_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ Ví dụ: `/them KEY123 2h` hoặc `/them KEY123 30m`", parse_mode='Markdown')
-        return
-
-    new_key = context.args[0]
-    time_arg = context.args[1].lower()
-
-    match = re.match(r"^(\d+)([hm])$", time_arg)
-    if not match:
-        await update.message.reply_text("❌ Dùng `h` cho giờ hoặc `m` cho phút.", parse_mode='Markdown')
-        return
-
-    val, unit = int(match.group(1)), match.group(2)
-    now = get_now_vn()
-
-    if unit == 'h':
-        expiry = now + datetime.timedelta(hours=val)
-        time_desc = f"{val} giờ"
-    else:
-        expiry = now + datetime.timedelta(minutes=val)
-        time_desc = f"{val} phút"
-
-    kho_key.append({'key': new_key, 'expiry': expiry})
-    time_str = expiry.strftime("%H:%M:%S %d/%m/%Y")
-    
-    await update.message.reply_text(
-        f"✅ **Đã thêm key:** `{new_key}`\n"
-        f"⏳ Hạn dùng: **{time_desc}** (Hết hạn lúc {time_str})",
-        parse_mode='Markdown'
-    )
-
-async def so_luong_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    cleanup_keys()
-    await update.message.reply_text(f"📊 Trong kho hiện còn: **{len(kho_key)}** key hợp lệ.", parse_mode='Markdown')
-
-async def xem_toan_bo_kho(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    cleanup_keys()
-    
-    if not kho_key:
-        await update.message.reply_text("📦 Kho key hiện đang trống!", parse_mode='Markdown')
-        return
-
-    msg = f"📦 **DANH SÁCH KEY TRONG KHO ({len(kho_key)} key):**\n\n"
-    for i, item in enumerate(kho_key, 1):
-        time_str = item['expiry'].strftime("%H:%M:%S %d/%m/%Y")
-        msg += f"{i}. Key: `{item['key']}`\n   ⏳ Hết hạn: {time_str}\n"
-
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def thong_bao(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ **Cú pháp sai!**\nVí dụ: `/thongbao Kho key vừa được cập nhật thêm 50 key mới!`", parse_mode='Markdown')
-        return
-
-    noi_dung = " ".join(context.args)
-    msg = f"📢 **THÔNG BÁO TỪ ADMIN:**\n\n{noi_dung}"
-    
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-# ==========================================
-# 8. KHỞI CHẠY BOT
-# ==========================================
-if __name__ == '__main__':
-    t = threading.Thread(target=run_dummy_server)
-    t.daemon = True
-    t.start()
-
-    app = ApplicationBuilder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("laykey", lay_key_cmd))
-    app.add_handler(CommandHandler("them", them_key))
-    app.add_handler(CommandHandler("soluong", so_luong_key))
-    app.add_handler(CommandHandler("xemkho", xem_toan_bo_kho))
-    app.add_handler(CommandHandler("thongbao", thong_bao))
-    
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
-    
-    print("Bot đang chạy...")
-    app.run_polling()
-                
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
