@@ -209,7 +209,8 @@ def main_menu_keyboard():
 
 # ========================== START ==========================
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     user = message.from_user
     register_user(user.id, user.username, user.full_name)
     await message.answer(
@@ -221,7 +222,8 @@ async def cmd_start(message: Message):
 
 # ========================== CALLBACKS ==========================
 @dp.callback_query(lambda c: c.data == "balance")
-async def show_balance(callback: CallbackQuery):
+async def show_balance(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     bal = get_balance(callback.from_user.id)
     await callback.message.edit_text(
         f"💰 **Số dư của bạn:** {bal:,}đ",
@@ -231,7 +233,8 @@ async def show_balance(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "deposit")
-async def show_deposit(callback: CallbackQuery):
+async def show_deposit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     user_id = callback.from_user.id
     text = (
         "💳 **NẠP TIỀN**\n\n"
@@ -245,25 +248,26 @@ async def show_deposit(callback: CallbackQuery):
         "👉 Sau khi chuyển, bấm nút bên dưới."
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("🔄 Kiểm tra lại / Làm mới", callback_data="check_deposit")],
-        [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+        [InlineKeyboardButton(text="🔄 Kiểm tra lại / Làm mới", callback_data="check_deposit")],
+        [InlineKeyboardButton(text="🔙 Trở lại", callback_data="back_main")]
     ])
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "check_deposit")
-async def check_deposit(callback: CallbackQuery):
+async def check_deposit(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "💳 Nhập **số tiền** bạn đã chuyển (VD: 50000):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+            [InlineKeyboardButton(text="🔙 Trở lại", callback_data="back_main")]
         ])
     )
     await callback.answer()
-    await dp.fsm.storage.set_state(chat=callback.message.chat.id, user=callback.from_user.id, state=DepositStates.waiting_amount)
+    await state.set_state(DepositStates.waiting_amount)
 
 @dp.callback_query(lambda c: c.data == "buy_menu")
-async def show_buy_menu(callback: CallbackQuery):
+async def show_buy_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     categories = get_categories()
     if not categories:
         await callback.message.edit_text("❌ Chưa có loại acc nào.", reply_markup=main_menu_keyboard())
@@ -278,15 +282,16 @@ async def show_buy_menu(callback: CallbackQuery):
         name = cat[1]
         text += f"• **{name}**\n  Giá: {price:,}đ | Tồn: {stock}\n\n"
         if stock > 0:
-            buttons.append([InlineKeyboardButton(f"Mua {name} ({price:,}đ)", callback_data=f"buy_{cat[0]}")])
+            buttons.append([InlineKeyboardButton(text=f"Mua {name} ({price:,}đ)", callback_data=f"buy_{cat[0]}")])
     if not buttons:
         text += "❌ Tất cả acc đã hết hàng."
-    buttons.append([InlineKeyboardButton("🔙 Trở lại menu", callback_data="back_main")])
+    buttons.append([InlineKeyboardButton(text="🔙 Trở lại menu", callback_data="back_main")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("buy_"))
-async def process_buy(callback: CallbackQuery):
+async def process_buy(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     category_id = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
 
@@ -316,7 +321,8 @@ async def process_buy(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "history")
-async def show_history(callback: CallbackQuery):
+async def show_history(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     user_id = callback.from_user.id
     transactions = get_user_transactions(user_id, limit=10)
     if not transactions:
@@ -330,19 +336,21 @@ async def show_history(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "contact")
-async def show_contact(callback: CallbackQuery):
+async def show_contact(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     text = "📞 **LIÊN HỆ**\n\n• Chat admin để xử lý nhanh\n• Vào nhóm chat để hỏi thêm\n• Theo dõi kênh để cập nhật"
     buttons = [
-        [InlineKeyboardButton("👤 Chat Admin", url="https://t.me/huyh_ff")],
-        [InlineKeyboardButton("📢 Kênh", url="https://t.me/Xxxhuyh")],
-        [InlineKeyboardButton("👥 Nhóm chat", url="https://t.me/your_group_chat")],
-        [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
+        [InlineKeyboardButton(text="👤 Chat Admin", url="https://t.me/huyh_ff")],
+        [InlineKeyboardButton(text="📢 Kênh", url="https://t.me/Xxxhuyh")],
+        [InlineKeyboardButton(text="👥 Nhóm chat", url="https://t.me/your_group_chat")],
+        [InlineKeyboardButton(text="🔙 Trở lại", callback_data="back_main")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "back_main")
-async def back_to_main(callback: CallbackQuery):
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text("🏠 **Menu chính**", reply_markup=main_menu_keyboard())
     await callback.answer()
 
@@ -361,8 +369,8 @@ async def deposit_amount(message: Message, state: FSMContext):
     deposit_id = create_pending_deposit(user_id, amount)
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("✅ Xác nhận", callback_data=f"confirm_deposit_{deposit_id}")],
-        [InlineKeyboardButton("❌ Từ chối", callback_data=f"reject_deposit_{deposit_id}")]
+        [InlineKeyboardButton(text="✅ Xác nhận", callback_data=f"confirm_deposit_{deposit_id}")],
+        [InlineKeyboardButton(text="❌ Từ chối", callback_data=f"reject_deposit_{deposit_id}")]
     ])
     await bot.send_message(
         ADMIN_ID,
@@ -379,7 +387,8 @@ async def deposit_amount(message: Message, state: FSMContext):
 
 # ========================== ADMIN XỬ LÝ NẠP ==========================
 @dp.callback_query(lambda c: c.data and c.data.startswith("confirm_deposit_"))
-async def confirm_deposit(callback: CallbackQuery):
+async def confirm_deposit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     deposit_id = int(callback.data.split("_")[2])
     deposit = get_pending_deposit(deposit_id)
     if not deposit or deposit[3] != 'pending':
@@ -397,7 +406,8 @@ async def confirm_deposit(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("reject_deposit_"))
-async def reject_deposit(callback: CallbackQuery):
+async def reject_deposit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     deposit_id = int(callback.data.split("_")[2])
     deposit = get_pending_deposit(deposit_id)
     if not deposit or deposit[3] != 'pending':
@@ -413,7 +423,8 @@ async def reject_deposit(callback: CallbackQuery):
 
 # ========================== ADMIN LỆNH ==========================
 @dp.message(Command("addcat"))
-async def add_category(message: Message):
+async def add_category(message: Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split(maxsplit=3)
@@ -433,7 +444,8 @@ async def add_category(message: Message):
     conn.close()
 
 @dp.message(Command("delcat"))
-async def delete_category(message: Message):
+async def delete_category(message: Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split(maxsplit=1)
@@ -452,7 +464,8 @@ async def delete_category(message: Message):
     conn.close()
 
 @dp.message(Command("pending"))
-async def list_pending(message: Message):
+async def list_pending(message: Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id != ADMIN_ID:
         return
     conn = get_db()
@@ -469,7 +482,8 @@ async def list_pending(message: Message):
     await message.answer(text)
 
 @dp.message(Command("addmoney"))
-async def add_money(message: Message):
+async def add_money(message: Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split()
