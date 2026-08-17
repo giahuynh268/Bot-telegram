@@ -230,20 +230,19 @@ async def show_balance(callback: CallbackQuery):
     )
     await callback.answer()
 
-# ====================== NẠP TIỀN (CÓ PLACEHOLDER) ======================
 @dp.callback_query(lambda c: c.data == "deposit")
 async def show_deposit(callback: CallbackQuery):
     user_id = callback.from_user.id
     text = (
-        "💳 **NẠP TIỀN TỰ ĐỘNG**\n\n"
+        "💳 **NẠP TIỀN**\n\n"
         "• STK: 123456789\n"
         "• Bank: MB Bank\n"
         "• Chủ TK: NGUYEN VAN A\n"
         f"• Nội dung (BẮT BUỘC): `NAP{user_id}`\n\n"
-        "Chuyển bao nhiêu thì bot sẽ cộng đúng bấy nhiêu vào số dư.\n"
+        "Chuyển bao nhiêu thì bot sẽ cộng đúng bấy nhiêu.\n"
         "Không cần nhập số tiền trước, không cần tạo đơn.\n"
-        "Bot tự động quét API ngân hàng mỗi vài giây.\n\n"
-        "👉 Sau khi chuyển, bấm nút bên dưới để kiểm tra."
+        "Bot tự quét API ngân hàng mỗi vài giây.\n\n"
+        "👉 Sau khi chuyển, bấm nút bên dưới."
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("🔄 Kiểm tra lại / Làm mới", callback_data="check_deposit")],
@@ -255,7 +254,7 @@ async def show_deposit(callback: CallbackQuery):
 @dp.callback_query(lambda c: c.data == "check_deposit")
 async def check_deposit(callback: CallbackQuery):
     await callback.message.edit_text(
-        "💳 Vui lòng nhập **số tiền bạn đã chuyển** (VD: 50000):",
+        "💳 Nhập **số tiền** bạn đã chuyển (VD: 50000):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton("🔙 Trở lại", callback_data="back_main")]
         ])
@@ -263,7 +262,6 @@ async def check_deposit(callback: CallbackQuery):
     await callback.answer()
     await dp.fsm.storage.set_state(chat=callback.message.chat.id, user=callback.from_user.id, state=DepositStates.waiting_amount)
 
-# ====================== MUA ACC ======================
 @dp.callback_query(lambda c: c.data == "buy_menu")
 async def show_buy_menu(callback: CallbackQuery):
     categories = get_categories()
@@ -348,7 +346,7 @@ async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text("🏠 **Menu chính**", reply_markup=main_menu_keyboard())
     await callback.answer()
 
-# ====================== NHẬP SỐ TIỀN NẠP ======================
+# ========================== NHẬP SỐ TIỀN NẠP ==========================
 @dp.message(StateFilter(DepositStates.waiting_amount))
 async def deposit_amount(message: Message, state: FSMContext):
     try:
